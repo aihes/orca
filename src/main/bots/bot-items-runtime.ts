@@ -28,6 +28,8 @@ import type { BotItemMail, BotItemRecord, BotItemSource } from './bot-items-sche
 import type { BotWorkRuntime } from './bot-work-runtime'
 import type { BotsDbWorkerClient } from './db-worker/bots-db-worker-client'
 import { BotItemUsageLimitWaits } from './bot-item-usage-limit-wait'
+import { BotItemAskWithdrawals } from './bot-item-ask-withdrawals'
+import { botItemAskWhileWorker } from './bot-item-ask-while-worker'
 
 export type BotItemsHostDeps = {
   workRuntime: BotWorkRuntime
@@ -57,6 +59,7 @@ export class BotItemsHost {
   private readonly workerLinks: BotItemWorkerLinks
   private mailing: Promise<void> | null = null
   private readonly usageLimitWaits: BotItemUsageLimitWaits
+  private readonly askWithdrawals: BotItemAskWithdrawals
   private mailAgain = false
 
   constructor(private readonly deps: BotItemsHostDeps) {
@@ -81,6 +84,20 @@ export class BotItemsHost {
       },
       root: deps.chatRoot,
       changed: (items) => this.notifyChanged(items)
+    })
+    this.askWithdrawals = new BotItemAskWithdrawals({
+      store: () => this.openedStore(),
+      worker: (ref) => botItemAskWhileWorker(db(), ref),
+      workerTitle: async (refs) => {
+        const workers = await this.join.readLinkedWorkers(refs, { pullRequests: false })
+        return new Map(
+          [...workers].flatMap(([ref, read]) =>
+            read.worker?.title ? [[ref, read.worker.title]] : []
+          )
+        )
+      },
+      changed: (items) => this.notifyChanged(items),
+      sendOwedMail: () => this.sendOwedMail()
     })
   }
 
@@ -133,6 +150,8 @@ export class BotItemsHost {
       this.store()
     }
     await this.sendOwedMail()
+    // An ask whose worker ended or time passed while Orca was closed is withdrawn now.
+    this.askWithdrawals.tick()
   }
 
   /** Leaves the bots DB worker client alone: the runtime owns it, shared with the work record. */
@@ -181,6 +200,7 @@ export class BotItemsHost {
     this.notifyChanged(items)
     if (items.length > 0) {
       this.usageLimitWaits.recheck()
+      this.askWithdrawals.itemsChanged()
     }
   }
 
@@ -191,9 +211,11 @@ export class BotItemsHost {
     }
   }
 
-  /** The scheduler's minute: a usage-limit stop whose time passed unannounced ends. */
-  usageLimitTick(now: number): void {
+  /** The scheduler's minute: a usage-limit stop whose time passed unannounced ends, and an ask whose
+   *  `--while` settled is withdrawn. */
+  minuteTick(now: number): void {
     this.usageLimitWaits.tick(now)
+    this.askWithdrawals.tick(now)
   }
 
   /** Mail every change still owed. One pass at a time; a call during one makes it run again,
@@ -327,6 +349,7 @@ export class BotItemsHost {
       this.workerLinks.dispatchChanged(dispatchId)
       // A worker that finished can leave only stopped ones on its item.
       this.usageLimitWaits.recheck()
+      this.askWithdrawals.dispatchChanged()
     }
   }
 
